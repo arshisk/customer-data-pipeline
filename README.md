@@ -1,6 +1,6 @@
 # Customer Data Pipeline 🚀
 
-A production-style data pipeline built with Flask, FastAPI, PostgreSQL, and Docker.
+A production-style data pipeline built with Flask, FastAPI, PostgreSQL, dlt, and Docker.
 
 ---
 
@@ -14,7 +14,8 @@ Flask Mock Server → FastAPI Pipeline → PostgreSQL Database
 ```
 
 - **Flask** serves 20 fake customers from a JSON file
-- **FastAPI** fetches that data, stores it in PostgreSQL, and exposes query endpoints
+- **FastAPI** fetches that data and triggers the dlt pipeline
+- **dlt (data load tool)** handles ingestion and upsert into PostgreSQL automatically
 - **PostgreSQL** stores the data permanently
 - **Docker Compose** runs all 3 services together
 
@@ -31,8 +32,9 @@ Flask Mock Server → FastAPI Pipeline → PostgreSQL Database
 │                 │                              │                      │
 └─────────────────┘                              └──────────┬───────────┘
                                                             │
-                                                            │ SQLAlchemy
-                                                            │ Upsert
+                                                            │ dlt pipeline
+                                                            │ (merge/upsert)
+                                                            │ + SQLAlchemy
                                                             ▼
                                                  ┌──────────────────────┐
                                                  │                      │
@@ -45,14 +47,36 @@ Flask Mock Server → FastAPI Pipeline → PostgreSQL Database
 
 ---
 
+## How dlt Works Here
+
+**dlt (data load tool)** is a Python library for building data pipelines. In this project:
+
+- A `@dlt.resource` decorator defines the customer data source
+- `write_disposition="merge"` tells dlt to **upsert** automatically:
+  - If `customer_id` doesn't exist → **INSERT**
+  - If `customer_id` already exists → **UPDATE**
+- dlt handles schema creation, type inference, and loading into PostgreSQL
+- No duplicate records even if `/api/ingest` is called multiple times
+
+```python
+@dlt.resource(name="customers", write_disposition="merge", primary_key="customer_id")
+def customers_resource(customers_data: list):
+    for customer in customers_data:
+        yield prepare_customer_for_dlt(customer)
+```
+
+---
+
 ## Tech Stack
 
-| Service           | Technology              | Port |
-|-------------------|-------------------------|------|
-| Mock Data Server  | Python 3.13 + Flask     | 5000 |
-| Pipeline API      | Python 3.13 + FastAPI   | 8000 |
-| Database          | PostgreSQL 15           | 5432 |
-| Containerization  | Docker + Docker Compose | —    |
+| Service           | Technology                      | Port |
+|-------------------|---------------------------------|------|
+| Mock Data Server  | Python 3.13 + Flask             | 5000 |
+| Pipeline API      | Python 3.13 + FastAPI           | 8000 |
+| Data Ingestion    | dlt (data load tool) 1.24.0     | —    |
+| ORM               | SQLAlchemy 2.0.36               | —    |
+| Database          | PostgreSQL 15                   | 5432 |
+| Containerization  | Docker + Docker Compose         | —    |
 
 ---
 
@@ -81,7 +105,7 @@ customer-data-pipeline/
     │   └── customer.py             # SQLAlchemy customer table model
     └── services/
         ├── __init__.py
-        └── ingestion.py            # Fetch from Flask + upsert to DB
+        └── ingestion.py            # dlt pipeline + SQLAlchemy upsert
 ```
 
 ---
@@ -97,7 +121,7 @@ customer-data-pipeline/
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/customer-data-pipeline.git
+git clone https://github.com/arshisk/customer-data-pipeline.git
 cd customer-data-pipeline
 ```
 
@@ -115,7 +139,16 @@ pipeline_service  | INFO:     Application startup complete.
 
 ### 4. Run the ingest to load data
 ```bash
+# On Linux/Mac
 curl -X POST http://localhost:8000/api/ingest
+
+# On Windows PowerShell
+Invoke-WebRequest -Uri http://localhost:8000/api/ingest -Method POST
+```
+
+### 5. Or use the interactive API docs
+```
+http://localhost:8000/docs
 ```
 
 ---
@@ -132,12 +165,12 @@ curl -X POST http://localhost:8000/api/ingest
 
 ### Pipeline Service (Port 8000)
 
-| Method | Endpoint                    | Description                        |
-|--------|-----------------------------|------------------------------------|
-| GET    | /api/health                 | Health check                       |
-| POST   | /api/ingest                 | Fetch from Flask + save to DB      |
-| GET    | /api/customers              | Paginated customers from DB        |
-| GET    | /api/customers/{id}         | Single customer from DB            |
+| Method | Endpoint                    | Description                              |
+|--------|-----------------------------|-----------------------------------------|
+| GET    | /api/health                 | Health check                             |
+| POST   | /api/ingest                 | Fetch from Flask → dlt → PostgreSQL      |
+| GET    | /api/customers              | Paginated customers from DB              |
+| GET    | /api/customers/{id}         | Single customer from DB                  |
 
 ---
 
@@ -166,7 +199,7 @@ curl http://localhost:5000/api/customers/CUST999
 
 ### FastAPI Pipeline Service
 ```bash
-# Ingest all data from Flask into PostgreSQL
+# Ingest all data from Flask into PostgreSQL via dlt
 curl -X POST http://localhost:8000/api/ingest
 
 # Get all customers from database
@@ -186,13 +219,28 @@ curl http://localhost:8000/api/customers/CUST999
 
 ## Environment Variables
 
-| Variable       | Service          | Value                                               |
-|----------------|------------------|-----------------------------------------------------|
-| DATABASE_URL   | pipeline-service | postgresql://postgres:password@postgres:5432/customer_db |
-| FLASK_BASE_URL | pipeline-service | http://mock-server:5000                             |
-| POSTGRES_USER  | postgres         | postgres                                            |
-| POSTGRES_PASSWORD | postgres      | password                                            |
-| POSTGRES_DB    | postgres         | customer_db                                         |
+| Variable          | Service          | Value                                                    |
+|-------------------|------------------|----------------------------------------------------------|
+| DATABASE_URL      | pipeline-service | postgresql://postgres:password@postgres:5432/customer_db |
+| FLASK_BASE_URL    | pipeline-service | http://mock-server:5000                                  |
+| POSTGRES_USER     | postgres         | postgres                                                 |
+| POSTGRES_PASSWORD | postgres         | password                                                 |
+| POSTGRES_DB       | postgres         | customer_db                                              |
+
+---
+
+## API Response Format
+
+All list endpoints return this exact format:
+```json
+{
+  "data": [...],
+  "total": 20,
+  "page": 1,
+  "limit": 10,
+  "total_pages": 2
+}
+```
 
 ---
 
@@ -200,7 +248,6 @@ curl http://localhost:8000/api/customers/CUST999
 
 **1. Port already in use**
 ```bash
-# Stop all containers and try again
 docker-compose down
 docker-compose up --build
 ```
@@ -209,7 +256,7 @@ docker-compose up --build
 ```bash
 # Check if postgres container is healthy
 docker ps
-# Wait a few seconds and retry — postgres needs time to initialize
+# Wait a few seconds — postgres needs time to initialize
 ```
 
 **3. Ingest returns error**
@@ -224,21 +271,6 @@ curl -X POST http://localhost:8000/api/ingest
 ```bash
 docker-compose down -v
 docker-compose up --build
-```
-
----
-
-## API Response Format
-
-All list endpoints return this format:
-```json
-{
-  "data": [...],
-  "total": 20,
-  "page": 1,
-  "limit": 10,
-  "total_pages": 2
-}
 ```
 
 ---
